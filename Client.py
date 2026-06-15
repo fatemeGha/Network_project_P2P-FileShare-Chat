@@ -2,7 +2,8 @@ import socket
 import threading
 import struct
 import time
-from constants import CTRL
+from constants import CTRL , CHAT , FILE_CHUNK , END_FILE
+import os
 
 class ClientState:
     def __init__(self, sock):
@@ -26,8 +27,9 @@ def receive_packet(sock):
     payload = recv_exact(sock, total_length - 1)
     if payload is None:
         return None, None
+    
+    return msg_type[0], payload
 
-    return msg_type[0], payload.decode("utf-8")
 
 
 def receive_messages(client_socket, state):
@@ -37,7 +39,14 @@ def receive_messages(client_socket, state):
             msg_type, payload = receive_packet(client_socket)
             if payload is None:
                 break
+            if msg_type == CTRL:
+                payload = payload.decode("utf-8")
 
+            elif msg_type == CHAT:
+                payload = payload.decode("utf-8")
+
+            elif msg_type == FILE_CHUNK:
+                pass
             print(f"\n[SERVER] {payload}")
 
             if payload == "AUTH_SUCCESS":
@@ -50,7 +59,12 @@ def receive_messages(client_socket, state):
                 sender = parts[1]
                 message = parts[2]
                 print(f"\n[CHAT] {sender}: {message}")
-
+            elif payload.startswith("ACK"):
+                ack_no = int(payload.split()[1])
+                print(f"ACK chunk {ack_no}")
+            elif payload.startswith("PROGRESS"):
+                percent = payload.split()[1]
+                print(f"\rUploading... {percent}%",end="")
             elif payload == "OK":
                 pass
             
@@ -82,8 +96,20 @@ def send_packet(sock, msg_type, payload):
 
     sock.sendall(packet)
 
+def send_binary_chunk(sock,chunk_no,chunk):
+    meta = f"{chunk_no}|".encode("utf-8")
 
+    payload = meta + chunk
 
+    total_length = 1 + len(payload)
+    header = struct.pack("!I", total_length)
+
+    packet = (
+        header +
+        bytes([FILE_CHUNK]) +
+        payload
+    )
+    sock.sendall(packet)
 
 def show_menu(state):
     print("\n" + "=" * 40)
@@ -135,13 +161,44 @@ def show_menu(state):
             print("Invalid choice")
         return True
 def handle_share_file(state):
-    print()
-
-def handle_send_chat(state):
-    print()
+    print("share file")  
 
 def handle_upload_file(state):
-    print()
+
+    path = input("File path: ").strip()
+    if not os.path.exists(path):
+        print("File not found")
+        return
+
+    filename = os.path.basename(path)
+    filesize = os.path.getsize(path)
+
+    send_packet(
+        state.socket,
+        CTRL,
+        f"UPLOAD {filename} {filesize}"
+    )
+
+    with open(path, "rb") as f:
+        chunk_no = 1
+        while True:
+            chunk = f.read(1024)
+            if not chunk:
+                break
+
+            send_binary_chunk(
+                state.socket,
+                chunk_no,
+                chunk
+            )
+            chunk_no += 1
+
+    send_packet(
+        state.socket,
+        END_FILE,
+        f"{filename}"
+    )
+
 
 def handle_register(state):
 
@@ -195,7 +252,7 @@ def handle_send_chat(state):
     send_packet(
         state.socket,
         CTRL,
-        f"CHAT {target} {msg}"
+        f"{target} {msg}"
     )
 
 

@@ -1,11 +1,15 @@
 import socket
 import threading
 import struct
-from constants import CTRL
+from constants import CTRL , CHAT , FILE_CHUNK , END_FILE
+import os
+
 
 HOST = '0.0.0.0' 
 PORT = 8080     
 BACKLOG = 5
+UPLOAD_DIR = "uploads"
+
 users = {}  # username -> password
 
 online_users = {}  
@@ -15,6 +19,15 @@ client_info = {}
 # client_socket -> username
 files = {}
 pending_shares = {}
+active_uploads = {}
+#  "filename": filename,
+#     "size": filesize,
+#     "received": 0,
+#     "expected_chunk": 1,
+#     "last_chunk": 0,
+#     "file": 
+
+
 
 def recv_exact(sock, n):
     data = b""
@@ -51,7 +64,7 @@ def receive_packet(sock):
     if payload is None:
         return None, None
 
-    return msg_type[0], payload.decode("utf-8")
+    return msg_type[0], payload
 
 
 def handle_client(client_socket, address):
@@ -59,7 +72,17 @@ def handle_client(client_socket, address):
     while True:
         try:
             msg_type, payload = receive_packet(client_socket)
+            if msg_type == CTRL:
+                payload = payload.decode("utf-8")
 
+            elif msg_type == CHAT:
+                payload = payload.decode("utf-8")
+            elif msg_type == FILE_CHUNK:
+                handle_file_chunk(client_socket,payload)
+
+            elif msg_type == END_FILE:
+                handle_end_file(client_socket)
+            
             if payload is None:
                 break
 
@@ -81,6 +104,8 @@ def handle_client(client_socket, address):
                 handle_list_files(client_socket)
             elif payload.startswith("CHAT"):
                 handle_chat(client_socket, payload)
+            elif payload.startswith("UPLOAD"):
+                handle_upload(client_socket, payload)
             else:
                 send_packet(client_socket,CTRL,"ERROR invalid command")
         except Exception as e:
@@ -99,9 +124,116 @@ def handle_client(client_socket, address):
     print(f"[DISCONNECT] {address} disconnected")
     client_socket.close()
 
+def handle_end_file(sock):
+
+    upload = active_uploads[sock]
+
+    upload["file"].close()
+
+    files[upload["filename"]] = {
+        "owner": client_info[sock],
+        "size": upload["size"]
+    }
+
+    del active_uploads[sock]
+
+    send_packet(
+        sock,
+        CTRL,
+        "UPLOAD_COMPLETE"
+    )
+
+
+def handle_file_chunk(sock, payload):
+
+    first = payload.find(b'|')
+
+    if first == -1:
+        send_packet(sock, CTRL, "ERROR invalid chunk")
+        return
+
+    chunk_no = int(payload[:first].decode())
+
+    chunk_data = payload[first + 1:]
+
+    upload = active_uploads[sock]
+
+    if chunk_no != upload["expected_chunk"]:
+        send_packet(sock, CTRL, "ERROR invalid chunk")
+        return
+
+    upload["file"].write(chunk_data)
+
+    upload["received"] += len(chunk_data)
+
+    upload["last_chunk"] = chunk_no
+
+    upload["expected_chunk"] += 1
+
+    send_packet(sock,CTRL,f"ACK {chunk_no}")
+
+    progress = (upload["received"] * 100) / upload["size"]
+    send_packet(sock,CTRL,f"PROGRESS {progress:.1f}")
+
+
+def handle_upload(sock, command):
+
+    if sock not in client_info:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR authentication required"
+        )
+        return
+
+    parts = command.split()
+
+    if len(parts) != 3:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR invalid UPLOAD"
+        )
+        return
+
+    filename = parts[1]
+
+    try:
+        filesize = int(parts[2])
+    except:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR invalid filesize"
+        )
+        return
+
+    filepath = os.path.join(
+        UPLOAD_DIR,
+        filename
+    )
+
+    f = open(filepath, "wb")
+
+    active_uploads[sock] = {
+        "filename": filename,
+        "size": filesize,
+        "received": 0,
+        "expected_chunk": 1,
+        "last_chunk": 0,
+        "file": f
+    }
+
+
+    send_packet(sock, CTRL, "OK")
 
 def handle_list_files(sock):
-    send_packet(sock, CTRL, users)
+    files_list = ",".join(files.keys())
+
+    if not files_list:
+        files_list = "empty"
+    send_packet(sock, CTRL,  f"FILES_LIST {files_list}")
+
 
 def handle_list_users(sock):
     user_list = ",".join(online_users.keys())
@@ -126,7 +258,7 @@ def handle_chat(sock, command):
     if len(parts) < 3:
         send_packet(
             sock,
-            CTRL,
+            CHAT,
             "ERROR invalid CHAT"
         )
         return
@@ -252,6 +384,7 @@ def start_server():
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(BACKLOG)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     print(f"[SERVER] Listening on {HOST}:{PORT}")
     
     while True:
