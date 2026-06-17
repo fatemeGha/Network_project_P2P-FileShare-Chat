@@ -407,7 +407,7 @@ def handle_reject_file(sock , command):
         CTRL,
         "Rejected"
     )
-    log_event("SHARE REJECT" , f"{sender} -> {client_info[sock]}file : {filename}")
+    log_event("SHARE REJECT" , f"{sender} -> {client_info[sock]} file : {filename}")
 
 
 
@@ -475,7 +475,7 @@ def handle_accept_file(sock , command):
         return
     sender = parts[1]
     filename = parts[2]
-    log_event("SHARE ACCEPT" , f"{sender} -> {client_info[sock]}file : {filename}")
+    log_event("SHARE ACCEPT" , f"{sender} -> {client_info[sock]} file : {filename}")
 
     handle_send_file(sock , filename , sender)
 
@@ -533,7 +533,7 @@ def handle_chat(sock, command):
         if target_user not in offline_messages :
             offline_messages.setdefault(target_user,[])
         offline_messages[target_user].append((sender,message))
-        log_event("MESSAGE STORED OFFLINE" , f"{sender}->{target_user} : {message}")
+        log_event("MESSAGE STORED OFFLINE" , f"{sender} -> {target_user} : {message}")
         send_packet(sock , CTRL , "MESSAGE STORED")
         return
 
@@ -542,7 +542,7 @@ def handle_chat(sock, command):
         CTRL,
         f"FROM_CHAT {sender} {message}"
     )
-    log_event("MESSAGE SENT" , f"{sender}->{target_user} : {message}")
+    log_event("MESSAGE SENT" , f"{sender} -> {target_user} : {message}")
 
     send_packet(
         sock,
@@ -624,7 +624,7 @@ def handle_login(sock, command):
     if username in offline_messages:        
         for m in offline_messages.get(username, []):
             send_packet(sock , CHAT ,f"FROM_CHAT {m["sender"]} {m["message"]}")
-            log_event("MESSAGE DELIVERED" , f"{m["sender"]}->{username} : {m["message"]}")
+            log_event("MESSAGE DELIVERED" , f"{m["sender"]} -> {username} : {m["message"]}")
         offline_messages[username].clear()
     online_users[username] = sock
     client_info[sock] = username
