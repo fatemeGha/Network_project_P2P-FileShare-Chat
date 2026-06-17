@@ -10,6 +10,7 @@ HOST = '0.0.0.0'
 PORT = 8080     
 BACKLOG = 5
 UPLOAD_DIR = "uploads"
+MAX_FILE_SIZE = 10_000_000 #10 MB
 
 users = {}  # username -> password
 
@@ -45,7 +46,7 @@ offline_messages = {}
 #     username : []
 # }
 
-def log_event(text):
+def log_event(event_type, text):
 
     with open(
         "server.log",
@@ -54,10 +55,12 @@ def log_event(text):
     ) as f:
 
         f.write(
-            f"{datetime.now()} {text}\n"
+            f"[{datetime.datetime.now()}] "
+            f"[{event_type}] "
+            f"{text}\n"
         )
 
-def chat_history(text):
+def save_chat_history(text):
 
     with open(
         "chat_history.log",
@@ -186,8 +189,8 @@ def handle_share(sock , command):
     if len(parts) < 3:
         send_packet(
             sock,
-            CHAT,
-            "ERROR invalid CHAT"
+            CTRL,
+            "ERROR invalid command"
         )
         return
 
@@ -225,6 +228,9 @@ def handle_share(sock , command):
         CTRL,
         "WAITING FOR RESPONSE"
     )
+    log_event("SHARE REQUEST" , f"{sender} -> {client_info[sock]}file : {filename}")
+
+
 def handle_end_file(sock):
 
     upload = active_uploads[sock]
@@ -243,10 +249,17 @@ def handle_end_file(sock):
         CTRL,
         "UPLOAD_COMPLETE"
     )
-
+    log_event("UPLOAD_COMPLETE" , f"{upload["filename"]}")
 
 def handle_file_chunk(sock, payload):
-
+    if sock not in active_uploads:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR upload session not found"
+        )
+        return
+    
     first = payload.find(b'|')
 
     if first == -1:
@@ -308,6 +321,13 @@ def handle_upload(sock, command):
             "ERROR invalid filesize"
         )
         return
+    if filesize > MAX_FILE_SIZE :
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR maximum file size is 10 MB"
+        )
+        return
     if filename in files.keys() :
         send_packet(
             sock,
@@ -332,7 +352,7 @@ def handle_upload(sock, command):
     }
 
 
-    send_packet(sock, CTRL, "waiting for file chunks")
+    send_packet(sock, CTRL, f"waiting_for_file_chunks {filename}")
 
 def handle_reject_file(sock , command):
     if sock not in client_info:
@@ -349,7 +369,7 @@ def handle_reject_file(sock , command):
         send_packet(
             sock,
             CTRL,
-            "ERROR invalid CHAT"
+            "ERROR invalid command"
         )
         return
 
@@ -385,8 +405,12 @@ def handle_reject_file(sock , command):
     send_packet(
         sock,
         CTRL,
-        "OK"
+        "Rejected"
     )
+    log_event("SHARE REJECT" , f"{sender} -> {client_info[sock]}file : {filename}")
+
+
+
 def send_binary_chunk(sock,chunk_no,chunk):
     meta = f"{chunk_no}|".encode("utf-8")
 
@@ -407,7 +431,7 @@ def handle_send_file( sock , filename , sender):
         UPLOAD_DIR,
         filename)
     send_packet(sock,CTRL,f"START_FILE {filename}")
-
+    log_event("START SEND FILE" , filename)
     with open(filepath,"rb") as f:
 
         chunk_no = 1
@@ -430,6 +454,7 @@ def handle_send_file( sock , filename , sender):
         online_users[sender],
         END_FILE,
         "File sent successfully.")
+    log_event("FILE SENT" , filename)
 
     send_packet(
         sock,
@@ -444,14 +469,14 @@ def handle_accept_file(sock , command):
     if len(parts) < 3:
         send_packet(
             sock,
-            CHAT,
-            "ERROR invalid CHAT"
+            CTRL,
+            "ERROR invalid command"
         )
         return
-
     sender = parts[1]
     filename = parts[2]
-    
+    log_event("SHARE ACCEPT" , f"{sender} -> {client_info[sock]}file : {filename}")
+
     handle_send_file(sock , filename , sender)
 
 def handle_list_files(sock):
@@ -508,6 +533,7 @@ def handle_chat(sock, command):
         if target_user not in offline_messages :
             offline_messages.setdefault(target_user,[])
         offline_messages[target_user].append((sender,message))
+        log_event("MESSAGE STORED OFFLINE" , f"{sender}->{target_user} : {message}")
         send_packet(sock , CTRL , "MESSAGE STORED")
         return
 
@@ -516,13 +542,27 @@ def handle_chat(sock, command):
         CTRL,
         f"FROM_CHAT {sender} {message}"
     )
+    log_event("MESSAGE SENT" , f"{sender}->{target_user} : {message}")
 
     send_packet(
         sock,
         CTRL,
-        "OK"
+        "Message sent successfully."
     )
+    record = {
+    "sender": sender,
+    "receiver": target_user,
+    "message": message,
+    "time": str(datetime.datetime.now())}
 
+    chat_history.append(record)
+
+    save_chat_history(
+        f"{record['time']}|"
+        f"{sender}|"
+        f"{target_user}|"
+        f"{message}"
+    )
 
 
 
@@ -537,6 +577,7 @@ def handle_register(sock, command):
     password = parts[2]
 
     if username in users:
+        log_event("REGISTER FAILED" , f"username= {username} already exists")
         send_packet(
             sock,
             CTRL,
@@ -544,8 +585,8 @@ def handle_register(sock, command):
         )
         return
     users[username] = password
-    send_packet(sock, CTRL, "OK")
-
+    send_packet(sock, CTRL, "Registration is done")
+    log_event("REGISTER" , username)
 
 
 
@@ -562,14 +603,17 @@ def handle_login(sock, command):
     password = parts[2]
 
     if username not in users:
+        log_event("AUTH_FAILED" , f"Username = {username}")
         send_packet(sock, CTRL, "AUTH_FAILED")
         return
 
     if users[username] != password:
+        log_event("INCORRECT PASSWORD" , f"Password = {password}")
         send_packet(sock, CTRL, "INCORRECT PASSWORD")
         return
 
     if username in online_users:
+        log_event("LOGIN Failed" , "user already logged in")
         send_packet(
             sock,
             CTRL,
@@ -580,12 +624,13 @@ def handle_login(sock, command):
     if username in offline_messages:        
         for m in offline_messages.get(username, []):
             send_packet(sock , CHAT ,f"FROM_CHAT {m["sender"]} {m["message"]}")
+            log_event("MESSAGE DELIVERED" , f"{m["sender"]}->{username} : {m["message"]}")
         offline_messages[username].clear()
     online_users[username] = sock
     client_info[sock] = username
 
     send_packet(sock, CTRL, "AUTH_SUCCESS")
-
+    log_event("LOGIN" , username)
 
 
 def handle_logout(sock):
@@ -602,8 +647,8 @@ def handle_logout(sock):
     username = client_info[sock]
     del client_info[sock]
     del online_users[username]
-
-    send_packet(sock, CTRL, "OK")
+    log_event("LOGIN" , username)
+    send_packet(sock, CTRL, "Logged out")
 
 
 

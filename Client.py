@@ -16,6 +16,11 @@ class ClientState:
         self.pending_username = None
         self.last_ack = 0
         self.waiting_response = False
+        self.show_menu = True
+        self.uploading_path = {}
+        # {
+        #     [filename] = path
+        # }
         self.pending_shares = []
         # {
         # "sender":"ali",
@@ -79,12 +84,14 @@ def receive_messages(client_socket, state):
                 state.logged_in = True
                 state.username = state.pending_username
                 print(f"[INFO] Login successful as {state.username}")
+                state.waiting_response = False
             
             elif payload.startswith("FROM_CHAT"):
                 parts = payload.split(" ", 2)
                 sender = parts[1]
                 message = parts[2]
                 print(f"\n[CHAT] {sender}: {message}")
+
 
             elif payload.startswith("ACK"):
                 ack_no = int(payload.split()[1])
@@ -104,6 +111,7 @@ def receive_messages(client_socket, state):
                 print("\n[NEW SHARE REQUEST]")
 
             elif payload.startswith("START_FILE"):
+                state.show_menu = False
                 filename = payload.split(" ", 1)[1]
 
                 folder = f"{DOWNLOAD_DIR}_{state.username}"
@@ -116,12 +124,25 @@ def receive_messages(client_socket, state):
                     "file": open(path, "wb"),
                     "expected_chunk": 1
                 }
-            elif payload.startswith("waiting for file chunks"):
+            elif payload.startswith("waiting_for_file_chunks"):
+                parts = payload.split(" ", 1)
+
+                start_upload(state ,parts[1])
+
                 state.waiting_response = True
                 continue
+
+            elif payload == "UPLOAD_COMPLETE":
+                print("\nUpload completed.")
+                state.waiting_response = False
+                time.sleep(0.2)
+                state.show_menu = True
+
+            elif payload.startswith("ONLINE_USERS") | payload.startswith("FILES") | payload.startswith("Rejected")  |  payload.startswith("Message sent successfully.") | payload.startswith("Registration is done")  | payload.startswith("Logged out") | payload.startswith("ERROR"):
+                state.waiting_response = False
+
             elif payload == "OK":
                 pass
-            state.waiting_response = False
             
         except Exception as e:
             print("Receive error:", e)
@@ -324,13 +345,15 @@ def handle_upload_file(state):
     filename = os.path.basename(path)
     filesize = os.path.getsize(path)
     state.waiting_response = True
-
+    state.uploading_path[filename] = path
     send_packet(
         state.socket,
         CTRL,
         f"UPLOAD {filename} {filesize}"
     )
 
+def start_upload(state ,filename):
+    path = state.uploading_path[filename]
     with open(path, "rb") as f:
         chunk_no = 1
         while True:
@@ -430,7 +453,7 @@ def start_client():
     receive_thread.start()
     while True:
 
-        if state.waiting_response:
+        if state.waiting_response | (not state.show_menu ):
             time.sleep(0.2)
             continue
 
