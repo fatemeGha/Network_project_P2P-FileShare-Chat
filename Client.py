@@ -5,6 +5,8 @@ import time
 from constants import CTRL , CHAT , FILE_CHUNK , END_FILE
 import os
 
+DOWNLOAD_DIR = "downloads"
+
 class ClientState:
     def __init__(self, sock):
         self.socket = sock
@@ -12,8 +14,19 @@ class ClientState:
         self.username = None
         self.current_download = None 
         self.pending_username = None
+        self.last_ack = 0
+        self.waiting_response = False
+        self.pending_shares = []
+        # {
+        # "sender":"ali",
+        # "filename":"test.pdf"
+        # }
+        self.current_download = {}
+        # "filename": None,
+        #     "file": None,
+        #     "expected_chunk": 1
 
-def receive_packet(sock):
+def receive_packet( sock):
     header = recv_exact(sock, 4)
     if not header:
         return None, None
@@ -40,13 +53,26 @@ def receive_messages(client_socket, state):
             if payload is None:
                 break
             if msg_type == CTRL:
+                state.waiting_response = False
                 payload = payload.decode("utf-8")
 
             elif msg_type == CHAT:
+                state.waiting_response = False
                 payload = payload.decode("utf-8")
 
             elif msg_type == FILE_CHUNK:
-                pass
+                state.waiting_response = True
+                handle_receive_file(state , payload)
+                continue
+            elif msg_type == END_FILE :
+                filename = payload.decode("utf-8")
+                if state.current_download:
+                    state.current_download["file"].close()
+                    print(f"\n[DOWNLOAD COMPLETE] "f"{filename}")
+                    state.current_download = None
+                state.waiting_response = False
+                continue  
+
             print(f"\n[SERVER] {payload}")
 
             if payload == "AUTH_SUCCESS":
@@ -59,14 +85,43 @@ def receive_messages(client_socket, state):
                 sender = parts[1]
                 message = parts[2]
                 print(f"\n[CHAT] {sender}: {message}")
+
             elif payload.startswith("ACK"):
                 ack_no = int(payload.split()[1])
                 print(f"ACK chunk {ack_no}")
+                state.waiting_response = True
+                continue
+
             elif payload.startswith("PROGRESS"):
                 percent = payload.split()[1]
                 print(f"\rUploading... {percent}%",end="")
+                state.waiting_response = True
+                continue
+
+            elif payload.startswith("SHARE_FILE_REQUEST"):
+                parts = payload.split(" ",2)
+                state.pending_shares.append({"sender": parts[1],"filename": parts[2]})
+                print("\n[NEW SHARE REQUEST]")
+
+            elif payload.startswith("START_FILE"):
+                filename = payload.split(" ", 1)[1]
+
+                folder = f"{DOWNLOAD_DIR}_{state.username}"
+                os.makedirs(folder, exist_ok=True)
+
+                path = os.path.join(folder, filename)
+
+                state.current_download = {
+                    "filename": filename,
+                    "file": open(path, "wb"),
+                    "expected_chunk": 1
+                }
+            elif payload.startswith("waiting for file chunks"):
+                state.waiting_response = True
+                continue
             elif payload == "OK":
                 pass
+            state.waiting_response = False
             
         except Exception as e:
             print("Receive error:", e)
@@ -85,7 +140,7 @@ def recv_exact(sock, n):
 
 
 def send_packet(sock, msg_type, payload):
-    
+
     payload_bytes = payload.encode("utf-8")
 
     total_length = 1 + len(payload_bytes)
@@ -110,6 +165,35 @@ def send_binary_chunk(sock,chunk_no,chunk):
         payload
     )
     sock.sendall(packet)
+
+def handle_receive_file(state, payload):
+
+    if state.current_download is None:
+        print("ERROR: no active download")
+        return
+
+    first = payload.find(b"|")
+
+    if first == -1:
+        print("ERROR: invalid chunk")
+        return
+
+    chunk_no = int(payload[:first].decode())
+
+    chunk_data = payload[first + 1:]
+
+    if chunk_no != state.current_download["expected_chunk"]:
+        print(
+            f"ERROR: expected "
+            f"{state.current_download['expected_chunk']} "
+            f"got {chunk_no}"
+        )
+        return
+
+    state.current_download["file"].write(chunk_data)
+
+    state.current_download["expected_chunk"] += 1
+
 
 def show_menu(state):
     print("\n" + "=" * 40)
@@ -139,7 +223,8 @@ def show_menu(state):
         print("  4. Upload File")
         print("  5. Share File")
         print("  6. Send Chat")
-        print("  7. Exit")
+        print("  7. Share file requests")
+        print("  8. Exit")
         print("=" * 40)
         choice = input("Select: ")
         if choice == "1":
@@ -155,13 +240,79 @@ def show_menu(state):
         elif choice =="6" :
             handle_send_chat(state)
         elif choice =="7" :
+            show_share_file_menu(state)
+        elif choice =="8" :
             handle_Exit(state)
             return False
         else:
             print("Invalid choice")
         return True
+    
+def show_share_file_menu(state, index=0):
+
+    if not state.pending_shares:
+        print("No pending requests")
+        return
+
+    if index >= len(state.pending_shares):
+        print("No more requests")
+        return
+
+    req = state.pending_shares[index]
+
+    sender = req["sender"]
+    filename = req["filename"]
+
+    print("\n" + "=" * 40)
+    print(" SHARE FILE MENU ")
+    print("=" * 40)
+
+    print(f"Sender   : {sender}")
+    print(f"Filename : {filename}")
+
+    print("1. Accept")
+    print("2. Reject")
+    print("3. Next request")
+    print("4. Back")
+
+    choice = input("Select: ")
+
+    if choice == "1":
+        state.pending_shares.pop(index)
+        state.waiting_response = True
+        send_packet(
+            state.socket,
+            CTRL,
+            f"ACCEPT_FILE {sender} {filename}"
+        )
+
+    elif choice == "2":
+        state.pending_shares.pop(index)
+        state.waiting_response = True
+        send_packet(
+            state.socket,
+            CTRL,
+            f"REJECT_FILE {sender} {filename}"
+        )
+
+    elif choice == "3":
+        show_share_file_menu(state, index + 1)
+    
 def handle_share_file(state):
-    print("share file")  
+    target = input("Target User: ").strip()
+    path = input("file path: ").strip()
+    filename = os.path.basename(path)
+    if not target or not path:
+        print("Invalid input")
+        return
+    state.waiting_response = True
+
+    send_packet(
+        state.socket,
+        CTRL,
+        f"SHARE_FILE {target} {filename}"
+    )
+
 
 def handle_upload_file(state):
 
@@ -172,6 +323,7 @@ def handle_upload_file(state):
 
     filename = os.path.basename(path)
     filesize = os.path.getsize(path)
+    state.waiting_response = True
 
     send_packet(
         state.socket,
@@ -192,6 +344,7 @@ def handle_upload_file(state):
                 chunk
             )
             chunk_no += 1
+    state.waiting_response = True
 
     send_packet(
         state.socket,
@@ -207,12 +360,14 @@ def handle_register(state):
     password = input("  Password: ").strip()
     
     if username and password:
+        state.waiting_response = True
         send_packet(state.socket, CTRL, f"REGISTER {username} {password}")
         print("  Sending registration request...")
     else:
         print("  [✗] Username and password cannot be empty")
 
 def handle_logout(state):
+    state.waiting_response = True
     send_packet(state.socket, CTRL, f"LOGOUT")
     state.logged_in = False
     state.username = None
@@ -220,10 +375,12 @@ def handle_logout(state):
 
 
 def handle_list_users(state):
+    state.waiting_response = True
     send_packet(state.socket, CTRL, "LIST_USERS")
     print("  Requesting user list...")
 
 def handle_list_files(state):
+    state.waiting_response = True
     send_packet(state.socket, CTRL, "LIST_FILES")
     print("  Requesting file list...")
 
@@ -234,6 +391,7 @@ def handle_login(state):
     state.pending_username = username
 
     if username and password:
+        state.waiting_response = True
         send_packet(state.socket, CTRL, f"LOGIN {username} {password}")
         print("  Sending login request...")
     else:
@@ -248,10 +406,11 @@ def handle_send_chat(state):
     if not target or not msg:
         print("Invalid input")
         return
+    state.waiting_response = True
 
     send_packet(
         state.socket,
-        CTRL,
+        CHAT,
         f"{target} {msg}"
     )
 
@@ -270,7 +429,11 @@ def start_client():
     receive_thread = threading.Thread(target=receive_messages, args=(client,state),daemon=True)
     receive_thread.start()
     while True:
-        time.sleep(0.5)
+
+        if state.waiting_response:
+            time.sleep(0.2)
+            continue
+
         if not show_menu(state):
             break
 

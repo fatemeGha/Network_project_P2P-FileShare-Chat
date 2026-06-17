@@ -1,3 +1,4 @@
+import datetime
 import socket
 import threading
 import struct
@@ -27,7 +28,46 @@ active_uploads = {}
 #     "last_chunk": 0,
 #     "file": 
 
+pending_shares = {}
+# pending_shares[receiver] = {
+#     "sender": sender,
+#     "filename": filename
+# }
+chat_history = []
+#      {
+#         "sender": sender,
+#         "target": target,
+#         "message": message
+#     }
 
+offline_messages = {}
+# {
+#     username : []
+# }
+
+def log_event(text):
+
+    with open(
+        "server.log",
+        "a",
+        encoding="utf8"
+    ) as f:
+
+        f.write(
+            f"{datetime.now()} {text}\n"
+        )
+
+def chat_history(text):
+
+    with open(
+        "chat_history.log",
+        "a",
+        encoding="utf8"
+    ) as f:
+
+        f.write(
+            f"{datetime.now()} {text}\n"
+        )
 
 def recv_exact(sock, n):
     data = b""
@@ -79,9 +119,11 @@ def handle_client(client_socket, address):
                 payload = payload.decode("utf-8")
             elif msg_type == FILE_CHUNK:
                 handle_file_chunk(client_socket,payload)
+                continue
 
             elif msg_type == END_FILE:
                 handle_end_file(client_socket)
+                continue
             
             if payload is None:
                 break
@@ -102,14 +144,21 @@ def handle_client(client_socket, address):
 
             elif payload == "LIST_FILES":   
                 handle_list_files(client_socket)
-            elif payload.startswith("CHAT"):
-                handle_chat(client_socket, payload)
+
             elif payload.startswith("UPLOAD"):
                 handle_upload(client_socket, payload)
+
+            elif payload.startswith("SHARE_FILE"):
+                handle_share(client_socket, payload)
+
+            elif payload.startswith("ACCEPT_FILE"):
+                handle_accept_file(client_socket, payload)
+
+            elif payload.startswith("REJECT_FILE"):
+                handle_reject_file(client_socket, payload)            
             else:
                 send_packet(client_socket,CTRL,"ERROR invalid command")
         except Exception as e:
-            print("SERVER ERROR:", e)
             break
     
     if client_socket in client_info:
@@ -123,7 +172,59 @@ def handle_client(client_socket, address):
 
     print(f"[DISCONNECT] {address} disconnected")
     client_socket.close()
+def handle_share(sock , command):
+    if sock not in client_info:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR authentication required"
+        )
+        return
 
+    parts = command.split(" ", 2)
+
+    if len(parts) < 3:
+        send_packet(
+            sock,
+            CHAT,
+            "ERROR invalid CHAT"
+        )
+        return
+
+    target_user = parts[1]
+    filename = parts[2]
+
+    if target_user not in users:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR target user not found"
+        )
+        return
+
+    if target_user not in online_users:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR target user is offline"
+        )
+        return
+
+    sender = client_info[sock]
+
+    target_socket = online_users[target_user]
+
+    send_packet(
+        target_socket,
+        CTRL,
+        f"SHARE_FILE_REQUEST {sender} {filename}"
+    )
+
+    send_packet(
+        sock,
+        CTRL,
+        "WAITING FOR RESPONSE"
+    )
 def handle_end_file(sock):
 
     upload = active_uploads[sock]
@@ -207,7 +308,13 @@ def handle_upload(sock, command):
             "ERROR invalid filesize"
         )
         return
-
+    if filename in files.keys() :
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR The file exists on the server."
+        )
+        return
     filepath = os.path.join(
         UPLOAD_DIR,
         filename
@@ -225,7 +332,127 @@ def handle_upload(sock, command):
     }
 
 
-    send_packet(sock, CTRL, "OK")
+    send_packet(sock, CTRL, "waiting for file chunks")
+
+def handle_reject_file(sock , command):
+    if sock not in client_info:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR authentication required"
+        )
+        return
+
+    parts = command.split(" ", 2)
+
+    if len(parts) < 3:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR invalid CHAT"
+        )
+        return
+
+    target_user = parts[1]
+    filename = parts[2]
+
+    if target_user not in users:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR target user not found"
+        )
+        return
+
+    if target_user not in online_users:
+        send_packet(
+            sock,
+            CTRL,
+            "ERROR target user is offline"
+        )
+        return
+
+    sender = client_info[sock]
+
+    target_socket = online_users[target_user]
+
+    send_packet(
+        target_socket,
+        CTRL,
+        f"REJECT_FILE {sender} {filename}"
+    )
+
+    send_packet(
+        sock,
+        CTRL,
+        "OK"
+    )
+def send_binary_chunk(sock,chunk_no,chunk):
+    meta = f"{chunk_no}|".encode("utf-8")
+
+    payload = meta + chunk
+
+    total_length = 1 + len(payload)
+    header = struct.pack("!I", total_length)
+
+    packet = (
+        header +
+        bytes([FILE_CHUNK]) +
+        payload
+    )
+    sock.sendall(packet)
+
+def handle_send_file( sock , filename , sender):
+    filepath = os.path.join(
+        UPLOAD_DIR,
+        filename)
+    send_packet(sock,CTRL,f"START_FILE {filename}")
+
+    with open(filepath,"rb") as f:
+
+        chunk_no = 1
+
+        while True:
+
+            chunk = f.read(1024)
+
+            if not chunk:
+                break
+
+            send_binary_chunk(
+                sock,
+                chunk_no,
+                chunk)
+
+            chunk_no += 1
+    
+    send_packet(
+        online_users[sender],
+        END_FILE,
+        "File sent successfully.")
+
+    send_packet(
+        sock,
+        END_FILE,
+        filename)
+
+
+
+def handle_accept_file(sock , command):
+    parts = command.split(" ", 2)
+
+    if len(parts) < 3:
+        send_packet(
+            sock,
+            CHAT,
+            "ERROR invalid CHAT"
+        )
+        return
+
+    sender = parts[1]
+    filename = parts[2]
+    
+    handle_send_file(sock , filename , sender)
 
 def handle_list_files(sock):
     files_list = ",".join(files.keys())
@@ -273,18 +500,16 @@ def handle_chat(sock, command):
             "ERROR target user not found"
         )
         return
-
-    if target_user not in online_users:
-        send_packet(
-            sock,
-            CTRL,
-            "ERROR target user is offline"
-        )
-        return
-
     sender = client_info[sock]
 
     target_socket = online_users[target_user]
+
+    if target_user not in online_users:
+        if target_user not in offline_messages :
+            offline_messages.setdefault(target_user,[])
+        offline_messages[target_user].append((sender,message))
+        send_packet(sock , CTRL , "MESSAGE STORED")
+        return
 
     send_packet(
         target_socket,
@@ -350,9 +575,12 @@ def handle_login(sock, command):
             CTRL,
             "ERROR user already logged in"
         )
-
         return
-
+    
+    if username in offline_messages:        
+        for m in offline_messages.get(username, []):
+            send_packet(sock , CHAT ,f"FROM_CHAT {m["sender"]} {m["message"]}")
+        offline_messages[username].clear()
     online_users[username] = sock
     client_info[sock] = username
 
